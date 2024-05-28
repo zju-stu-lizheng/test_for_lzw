@@ -1,19 +1,20 @@
+# Fine-Tune Llama2-7b on SE paired dataset
 import os
-import json
 from dataclasses import dataclass, field
 from typing import Optional
 
-
+import torch
+from datasets import load_dataset
+from peft import AutoPeftModelForCausalLM, LoraConfig
+from peft import prepare_model_for_kbit_training
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, HfArgumentParser, TrainingArguments, TrainerCallback
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
-import torch
-from torch.utils.data import Dataset
-
 from trl import SFTTrainer
 from trl.trainer import ConstantLengthDataset
-from peft import LoraConfig
 
+from huggingface_hub import login
 
 @dataclass
 class ScriptArguments:
@@ -29,7 +30,7 @@ class ScriptArguments:
     seq_length: Optional[int] = field(default=1024, metadata={"help": "the sequence length"})
     num_workers: Optional[int] = field(default=4, metadata={"help": "the number of workers"})
 
-    max_steps: Optional[int] = field(default=10000, metadata={"help": "the maximum number of sgd steps"})
+    max_steps: Optional[int] = field(default=1000, metadata={"help": "the maximum number of sgd steps"})
     logging_steps: Optional[int] = field(default=10, metadata={"help": "the logging frequency"})
     save_steps: Optional[int] = field(default=10, metadata={"help": "the saving frequency"})
     per_device_train_batch_size: Optional[int] = field(default=4, metadata={"help": "the per device train batch size"})
@@ -47,7 +48,7 @@ class ScriptArguments:
 
     learning_rate: Optional[float] = field(default=1e-4, metadata={"help": "the learning rate"})
     lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "the lr scheduler type"})
-    num_warmup_steps: Optional[int] = field(default=1000, metadata={"help": "the number of warmup steps"})
+    num_warmup_steps: Optional[int] = field(default=100, metadata={"help": "the number of warmup steps"})
     weight_decay: Optional[float] = field(default=0.05, metadata={"help": "the weight decay"})
     optimizer_type: Optional[str] = field(default="paged_adamw_32bit", metadata={"help": "the optimizer type"})
 
@@ -64,12 +65,8 @@ class ScriptArguments:
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
-
-
-tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, trust_remote_code=True)
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "right"  # Fix weird overflow issue with fp16 training
-
+if script_args.group_by_length and script_args.packing:
+    raise ValueError("Cannot use both packing and group by length")
 
 
 class SavePeftModelCallback(TrainerCallback):
@@ -80,7 +77,84 @@ class SavePeftModelCallback(TrainerCallback):
         if "pytorch_model.bin" in os.listdir(checkpoint_path):
             os.remove(os.path.join(checkpoint_path, "pytorch_model.bin"))
         return control
-    
+
+def chars_token_ratio(dataset, tokenizer, nb_examples=400):
+    """
+    Estimate the average number of characters per token in the dataset.
+    """
+    total_characters, total_tokens = 0, 0
+    for _, example in tqdm(zip(range(nb_examples), iter(dataset)), total=nb_examples):
+        text = prepare_sample_text(example)
+        total_characters += len(text)
+        if tokenizer.is_fast:
+            total_tokens += len(tokenizer(text).tokens())
+        else:
+            total_tokens += len(tokenizer.tokenize(text))
+
+    return total_characters / total_tokens
+
+
+def print_trainable_parameters(model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
+    )
+
+
+def prepare_sample_text(example):
+    """Prepare the text from a sample of the dataset."""
+    text = f"Question: {example['question']}\n\nAnswer: {example['response_j']}"
+    return text
+
+
+def create_datasets(tokenizer, args):
+    dataset = load_dataset(
+        args.dataset_name,
+        data_dir=args.subset,
+        split=args.split,
+        use_auth_token=True,
+        num_proc=args.num_workers if not args.streaming else None,
+        streaming=args.streaming,
+    )
+    if args.streaming:
+        print("Loading the dataset in streaming mode")
+        valid_data = dataset.take(args.size_valid_set)
+        train_data = dataset.skip(args.size_valid_set)
+        train_data = train_data.shuffle(buffer_size=args.shuffle_buffer, seed=None)
+    else:
+        dataset = dataset.train_test_split(test_size=0.005, seed=None)
+        train_data = dataset["train"]
+        valid_data = dataset["test"]
+        print(f"Size of the train set: {len(train_data)}. Size of the validation set: {len(valid_data)}")
+
+    chars_per_token = chars_token_ratio(train_data, tokenizer)
+    print(f"The character to token ratio of the dataset is: {chars_per_token:.2f}")
+
+    train_dataset = ConstantLengthDataset(
+        tokenizer,
+        train_data,
+        formatting_func=prepare_sample_text,
+        infinite=True,
+        seq_length=args.seq_length,
+        chars_per_token=chars_per_token,
+    )
+    valid_dataset = ConstantLengthDataset(
+        tokenizer,
+        valid_data,
+        formatting_func=prepare_sample_text,
+        infinite=False,
+        seq_length=args.seq_length,
+        chars_per_token=chars_per_token,
+    )
+    return train_dataset, valid_dataset
 
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
@@ -97,6 +171,7 @@ peft_config = LoraConfig(
     task_type="CAUSAL_LM",
 )
 
+
 base_model = AutoModelForCausalLM.from_pretrained(
     script_args.model_name,
     quantization_config=bnb_config,
@@ -107,38 +182,12 @@ base_model = AutoModelForCausalLM.from_pretrained(
 base_model.config.use_cache = False
 
 
-def prepare_sample_text(example):
-    """Prepare the text from a sample of the dataset."""
-    text = f"Question: {example['query']}\n\nAnswer: {example['resp']}"
-    return text
 
-def get_dataset():
+tokenizer = AutoTokenizer.from_pretrained(script_args.model_name, trust_remote_code=True)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"  # Fix weird overflow issue with fp16 training
 
-    class JSONDataset(Dataset):
-        def __init__(self, json_file):
-            with open(json_file, 'r') as f:
-                self.data = json.load(f)
-
-        def __len__(self):
-            return len(self.data)
-
-        def __getitem__(self, idx):
-            return self.data[idx]
-        
-    dataset = JSONDataset("data.json")
-    train_dataset = ConstantLengthDataset(
-        tokenizer,
-        dataset,
-        formatting_func=prepare_sample_text,
-        infinite=True,
-        seq_length=128,
-        chars_per_token=3.6,
-    )    
-    return train_dataset
-
-train_dataset = get_dataset()
-
-# print(next(iter(train_dataset)))
+from transformers import AdamW
 
 training_args = TrainingArguments(
     output_dir=script_args.output_dir,
@@ -156,12 +205,19 @@ training_args = TrainingArguments(
     optim=script_args.optimizer_type,
     resume_from_checkpoint=script_args.resume_from_checkpoint,
     save_total_limit=script_args.save_total_limit,
+    deepspeed=script_args.deepspeed,
+    run_name=script_args.run_name,
     bf16=True,
+    remove_unused_columns=False,
 )
 
+train_dataset, eval_dataset = create_datasets(tokenizer, script_args)
+
+    
 trainer = SFTTrainer(
     model=base_model,
     train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
     peft_config=peft_config,
     packing=script_args.packing,
     max_seq_length=None,
@@ -169,7 +225,23 @@ trainer = SFTTrainer(
     args=training_args,
     callbacks=[SavePeftModelCallback],
 )
-
+# if script_args.resume_from_checkpoint is None:
+# elif script_args.resume_from_checkpoint is not None:
+#     from peft import get_peft_model, PeftModel
+#     # loading model from lora checkpoint
+#     model = prepare_model_for_kbit_training(base_model, use_gradient_checkpointing=script_args.gradient_checkpointing)
+#     model = PeftModel.from_pretrained(base_model, script_args.resume_from_checkpoint, is_trainable=True)
+#     model.print_trainable_parameters()
+#     trainer = SFTTrainer(
+#         model=model,
+#         train_dataset=train_dataset,
+#         eval_dataset=eval_dataset,
+#         packing=script_args.packing,
+#         max_seq_length=None,
+#         tokenizer=tokenizer,
+#         args=training_args,
+#         callbacks=[SavePeftModelCallback],
+#     )
 
 trainer.model.print_trainable_parameters()
 
@@ -178,3 +250,16 @@ if script_args.resume_from_checkpoint is None:
 else:
     trainer.train(resume_from_checkpoint=script_args.resume_from_checkpoint)
 trainer.save_model(script_args.output_dir)
+
+output_dir = os.path.join(script_args.output_dir, "final_checkpoint")
+trainer.model.save_pretrained(output_dir)
+
+# Free memory for merging weights
+del base_model
+torch.cuda.empty_cache()
+
+model = AutoPeftModelForCausalLM.from_pretrained(output_dir, device_map="auto", torch_dtype=torch.bfloat16)
+model = model.merge_and_unload()
+
+output_merged_dir = os.path.join(script_args.output_dir, "final_merged_checkpoint")
+model.save_pretrained(output_merged_dir, safe_serialization=True)
