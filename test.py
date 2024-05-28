@@ -13,8 +13,6 @@ from torch.utils.data import Dataset
 from trl import SFTTrainer
 from trl.trainer import ConstantLengthDataset
 from peft import LoraConfig
-
-
 @dataclass
 class ScriptArguments:
     model_name: Optional[str] = field(default="NousResearch/Llama-2-7b-chat-hf", metadata={"help": "the model name"})
@@ -178,3 +176,4 @@ if script_args.resume_from_checkpoint is None:
 else:
     trainer.train(resume_from_checkpoint=script_args.resume_from_checkpoint)
 trainer.save_model(script_args.output_dir)
+
